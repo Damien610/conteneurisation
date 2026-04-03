@@ -1,0 +1,631 @@
+## Objectifs
+
+- Déployer une base de données MySQL sur Kubernetes avec persistance des données
+- Gérer des secrets et des variables d'environnement dans Kubernetes
+- Exposer une application via un Service et un Ingress Kubernetes
+- Mettre en place un autoscaling horizontal avec le HorizontalPodAutoscaler
+- Comprendre la répartition des pods sur plusieurs nœuds
+- Distinguer Deployment et StatefulSet pour le stockage avec état
+
+---
+
+Pour ajouter un nouveau node à votre cluster Minikube, utilisez la commande suivante qui ajoutera un Worker node.
+
+```bash
+minikube node add
+```
+
+Vérifiez que vos 2 nœuds sont bien actifs :
+
+```bash
+kubectl get nodes
+```
+
+Vous devriez obtenir une sortie similaire à :
+
+```
+NAME           STATUS   ROLES           AGE   VERSION
+minikube       Ready    control-plane   1m    v1.38.1
+minikube-m02   Ready    <none>          1m    v1.38.1
+```
+
+---
+
+## Partie 1 — Conteneurisation de l'application Node.js
+
+### 1.1 — Application de démo
+
+Créez le fichier `index.js` suivant :
+
+```jsx
+const express = require('express');
+const mysql = require('mysql2/promise');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.get('/', async (req, res) => {
+  try {
+    const connection = await mysql.createConnection({
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT,
+      user: process.env.MYSQL_USER,
+      password: process.env.MYSQL_PASSWORD,
+      database: process.env.MYSQL_DATABASE,
+    });
+    const [rows] = await connection.execute('SELECT NOW() AS now');
+    await connection.end();
+    res.json({ message: 'Connexion MySQL OK', time: rows[0].now });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`App running on port ${PORT}`));
+```
+
+Créez le `package.json` :
+
+```json
+{
+  "name": "tp-app-mysql",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^4.18.0",
+    "mysql2": "^3.6.0"
+  }
+}
+```
+
+### 1.2 — Dockerfile
+
+```docker
+FROM node:22-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+EXPOSE 3000
+CMD ["node", "index.js"]
+```
+
+### 1.3 — Build et push vers le registry Minikube
+
+Si besoin, la documentation du registry de Minikube, est accessible ici :
+
+[Registries](https://minikube.sigs.k8s.io/docs/handbook/registry/)
+
+Activez l'addon registry de Minikube :
+
+```bash
+minikube addons enable registry
+```
+
+Vérifiez que le registry est bien démarré :
+
+```bash
+kubectl get pods -n kube-system | grep registry
+```
+
+Vous devriez voir deux pods `registry-*` et `registry-proxy-*` en statut `Running`.
+
+Buildez votre image en la taguant vers le registry local de Minikube :
+
+```bash
+docker build -t localhost:5000/tp-app-mysql:1.0.0 .
+```
+
+Le registry de Minikube écoute sur le port 5000, mais il n'est accessible depuis votre machine qu'en passant par un forward. Créez ce tunnel dans un terminal dédié :
+
+**Linux / macOS / Git Bash :**
+
+```bash
+kubectl port-forward -n kube-system service/registry 5000:80 &
+```
+
+**PowerShell :**
+
+```powershell
+Start-Process kubectl -ArgumentList "port-forward -n kube-system service/registry 5000:80"
+```
+
+Poussez ensuite l'image :
+
+```bash
+docker push localhost:5000/tp-app-mysql:1.0.0
+```
+
+---
+
+## Partie 2 — Namespace
+
+Isolez vos ressources dans un namespace dédié :
+
+```bash
+kubectl create namespace tp-app-mysql
+```
+
+Toutes les commandes suivantes utiliseront `-n tp-app-mysql`. Pour éviter de le répéter, vous pouvez définir le namespace par défaut :
+
+```bash
+kubectl config set-context --current --namespace=tp-app-mysql
+```
+
+---
+
+## Partie 3 — Secrets MySQL
+
+Ne stockez jamais vos credentials en clair dans un ConfigMap. Kubernetes fournit la ressource **Secret** pour cela.
+
+Créez le fichier `mysql-secret.yaml` :
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: tp-app-mysql
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: rootpassword
+  MYSQL_DATABASE: appdb
+  MYSQL_USER: appuser
+  MYSQL_PASSWORD: apppassword
+```
+
+Appliquez-le :
+
+```bash
+kubectl apply -f mysql-secret.yaml
+```
+
+> 💡 `stringData` vous permet d'écrire les valeurs en clair — Kubernetes les encode automatiquement en base64 à l'enregistrement.
+>
+
+---
+
+## Partie 4 — Persistance des données MySQL
+
+Un pod est éphémère : si MySQL redémarre sans volume, toutes les données sont perdues. Le **PersistentVolumeClaim** réserve du stockage durable.
+
+Créez `mysql-pvc.yaml` :
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  namespace: tp-app-mysql
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+```bash
+kubectl apply -f mysql-pvc.yaml
+```
+
+Vérifiez que le PVC est bien en statut `Bound` :
+
+```bash
+kubectl get pvc -n tp-app-mysql
+```
+
+---
+
+## Partie 5 — Déploiement MySQL
+
+Créez `mysql-deployment.yaml` :
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: tp-app-mysql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - containerPort: 3306
+          envFrom:
+            - secretRef:
+                name: mysql-secret
+          volumeMounts:
+            - name: mysql-storage
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: mysql-storage
+          persistentVolumeClaim:
+            claimName: mysql-pvc
+```
+
+```bash
+kubectl apply -f mysql-deployment.yaml
+```
+
+Créez ensuite le Service interne `mysql-service.yaml` :
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: tp-app-mysql
+spec:
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+      targetPort: 3306
+  clusterIP: None
+```
+
+```bash
+kubectl apply -f mysql-service.yaml
+```
+
+> 💡 `clusterIP: None` crée un **Service headless** : les autres pods pourront joindre MySQL simplement via le hostname `mysql`.
+>
+
+---
+
+## Partie 6 — ConfigMap de l'application
+
+Créez `app-configmap.yaml` pour les variables non sensibles :
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: tp-app-mysql
+data:
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_NAME: appdb
+  PORT: "3000"
+```
+
+```bash
+kubectl apply -f app-configmap.yaml
+```
+
+---
+
+## Partie 7 — Déploiement de l'application Node.js
+
+Créez `app-deployment.yaml` :
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-app
+  namespace: tp-app-mysql
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: node-app
+  template:
+    metadata:
+      labels:
+        app: node-app
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: node-app
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: node-app
+          image: localhost:5000/tp-app-mysql:1.0.0
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: mysql-secret
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+```
+
+```bash
+kubectl apply -f app-deployment.yaml
+```
+
+---
+
+## Partie 8 — Exposition de l'application (Service NodePort)
+
+Créez `app-service.yaml` :
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-app-service
+  namespace: tp-app-mysql
+spec:
+  type: NodePort
+  selector:
+    app: node-app
+  ports:
+    - port: 80
+      targetPort: 3000
+      nodePort: 30080
+```
+
+```bash
+kubectl apply -f app-service.yaml
+```
+
+Récupérez l'URL d'accès :
+
+```bash
+minikube service node-app-service -n tp-app-mysql --url
+```
+
+Testez avec curl :
+
+```bash
+curl $(minikube service node-app-service -n tp-app-mysql --url)
+curl $(minikube service node-app-service -n tp-app-mysql --url)/health
+```
+
+---
+
+## Partie 9 — Ingress
+
+L'Ingress permet de router le trafic HTTP entrant vers vos services via des règles basées sur le hostname ou le path, sans exposer un NodePort par service.
+
+Activez d'abord l'addon Ingress de Minikube :
+
+```bash
+minikube addons enable ingress
+```
+
+Vérifiez que le controller est bien démarré (cela peut prendre 1 à 2 minutes) :
+
+```bash
+kubectl get pods -n ingress-nginx
+```
+
+Créez `app-ingress.yaml` :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: node-app-ingress
+  namespace: tp-app-mysql
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: tp-app-mysql.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: node-app-service
+                port:
+                  number: 80
+```
+
+```bash
+kubectl apply -f app-ingress.yaml
+```
+
+Récupérez l'IP de Minikube et ajoutez-la à votre fichier `/etc/hosts` (Linux ou MacOS) ou `C:/Windows/System32/drivers/etc/hosts` (Windows) :
+
+```bash
+echo "$(minikube ip) tp-app-mysql.local" | sudo tee -a /etc/hosts
+```
+
+Vous pouvez désormais accéder à l'application via :
+
+```bash
+curl http://tp-app-mysql.local
+```
+
+> 💡 En production, l'Ingress remplace l'exposition directe via NodePort. Un seul Ingress Controller gère le trafic entrant pour **tous** les services du cluster, avec routing par hostname ou par path — c'est bien plus économique que d'ouvrir un NodePort par service.
+>
+
+**Questions  :**
+
+- Que faudrait-il modifier pour router `/api` vers un service et `/admin` vers un autre ?
+- Comment ajouteriez-vous HTTPS avec un certificat auto-signé ?
+
+---
+
+## Partie 10 — HorizontalPodAutoscaler
+
+Le HPA surveille les métriques d'un Deployment et ajuste automatiquement le nombre de replicas en fonction de la charge.
+
+### 10.1 — Activer le Metrics Server
+
+Le HPA a besoin du **Metrics Server** pour lire les métriques CPU/mémoire des pods :
+
+```bash
+minikube addons enable metrics-server
+```
+
+Vérifiez qu'il est opérationnel :
+
+```bash
+kubectl top nodes
+```
+
+> ⚠️ Si la commande retourne une erreur, attendez 1 minute et réessayez — le Metrics Server prend quelques secondes à démarrer.
+>
+
+### 10.2 — Créer le HPA
+
+Créez `app-hpa.yaml` :
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: node-app-hpa
+  namespace: tp-app-mysql
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: node-app
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+```bash
+kubectl apply -f app-hpa.yaml
+```
+
+Observez le HPA en temps réel :
+
+```bash
+kubectl get hpa -n tp-app-mysql -w
+```
+
+### 10.3 — Simuler une montée en charge
+
+Ouvrez un second terminal et générez du trafic avec une boucle infinie :
+
+```bash
+kubectl run load-generator \
+  --image=busybox \
+  --restart=Never \
+  -n tp-app-mysql \
+  -- /bin/sh -c "while true; do wget -q -O- http://node-app-service/; done"
+```
+
+Dans votre premier terminal, surveillez le scaling :
+
+```bash
+kubectl get hpa,pods -n tp-app-mysql -w
+```
+
+Vous devriez voir le nombre de replicas augmenter au-delà de 2 lorsque le CPU dépasse 50%. Stoppez ensuite le générateur de charge :
+
+```bash
+kubectl delete pod load-generator -n tp-app-mysql
+```
+
+Après quelques minutes (le HPA attend par défaut 5 minutes avant de réduire), les replicas redescendront à 2.
+
+> 💡 Le HPA et `replicas` dans le Deployment coexistent : la valeur `replicas: 2` du Deployment devient le **plancher** — le HPA prend ensuite le relais pour tout ce qui est au-dessus. N'utilisez pas un nombre de replicas fixe élevé si vous utilisez un HPA, l'un annule l'effet de l'autre.
+>
+
+**Questions :**
+
+- Quelle est la différence entre un HPA et un **VPA** (Vertical Pod Autoscaler) ?
+- Pourquoi le scale down est-il volontairement plus lent que le scale up ?
+
+---
+
+## Partie 11 — Vérification et observation
+
+### Lister toutes les ressources du namespace
+
+```bash
+kubectl get all -n tp-app-mysql
+```
+
+### Vérifier la répartition des pods sur les nœuds
+
+```bash
+kubectl get pods -n tp-app-mysql -o wide
+```
+
+Observez la colonne `NODE` — les deux pods `node-app` doivent être sur des nœuds différents grâce à la règle `podAntiAffinity`.
+
+### Consulter les logs
+
+```bash
+kubectl logs -l app=node-app -n tp-app-mysql
+```
+
+### Inspecter un pod en détail
+
+```bash
+kubectl describe pod -l app=node-app -n tp-app-mysql
+```
+
+### Tester la résilience
+
+Supprimez manuellement un pod et observez Kubernetes le recréer automatiquement :
+
+```bash
+kubectl delete pod -l app=node-app -n tp-app-mysql --wait=false
+kubectl get pods -n tp-app-mysql -w
+```
+
+---
+
+## Questions
+
+1. Quelle est la différence entre un **Secret** et un **ConfigMap** ? Dans quels cas utiliser l'un ou l'autre ?
+2. Pourquoi MySQL ne tourne-t-il qu'avec `replicas: 1` alors que l'application en a `2` ?
+3. Que se passe-t-il si vous supprimez le PVC et que vous recréez le pod MySQL ? Que concluez-vous ?
+4. Expliquez le rôle de `podAntiAffinity` et ce qui se passerait sans cette règle sur un cluster de production.
+5. Quelle différence y a-t-il entre un Service de type `ClusterIP`, `NodePort` et `LoadBalancer` ?
+6. Pourquoi `imagePullPolicy: Never` est-il nécessaire ici mais pas en production ?
+7. Quelle est la différence entre un HPA et un **VPA** (Vertical Pod Autoscaler) ?
+8. Pourquoi le scale down du HPA est-il volontairement plus lent que le scale up ?
+9. En quoi le StatefulSet est-il plus adapté qu'un Deployment pour une base de données répliquée ?
