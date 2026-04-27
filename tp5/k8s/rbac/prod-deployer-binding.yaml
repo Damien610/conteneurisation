@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prod-deployer-binding
+  namespace: app-prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prod-deployer-role
+subjects:
+  - kind: User
+    name: prod-deployer
+    apiGroup: rbac.authorization.k8s.io
